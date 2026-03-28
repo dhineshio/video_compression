@@ -59,7 +59,7 @@ class VideoCompressorApp(ctk.CTk):
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(5, weight=1)
+        self.grid_rowconfigure(6, weight=1)
 
         # ── Video file row ────────────────────────────────────────────────────
         file_frame = ctk.CTkFrame(self)
@@ -93,9 +93,35 @@ class VideoCompressorApp(ctk.CTk):
                 row=0, column=i + 1, padx=12, pady=10
             )
 
+        # ── CPU Threads slider ────────────────────────────────────────────────
+        cpu_frame = ctk.CTkFrame(self)
+        cpu_frame.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
+
+        ctk.CTkLabel(cpu_frame, text="CPU Threads:", anchor="w", width=100).grid(
+            row=0, column=0, padx=(12, 6), pady=10
+        )
+        self.cpu_threads_var = ctk.IntVar(value=2)
+        self.cpu_slider = ctk.CTkSlider(
+            cpu_frame, from_=1, to=os.cpu_count() or 8,
+            number_of_steps=(os.cpu_count() or 8) - 1,
+            variable=self.cpu_threads_var,
+            command=lambda v: self.cpu_threads_label.configure(
+                text=f"{int(v)} / {os.cpu_count() or 8}"
+            ),
+        )
+        self.cpu_slider.grid(row=0, column=1, padx=6, pady=10, sticky="ew")
+        cpu_frame.grid_columnconfigure(1, weight=1)
+        self.cpu_threads_label = ctk.CTkLabel(
+            cpu_frame, text=f"2 / {os.cpu_count() or 8}", width=60, anchor="w"
+        )
+        self.cpu_threads_label.grid(row=0, column=2, padx=(4, 6))
+        ctk.CTkLabel(
+            cpu_frame, text="(fewer = cooler)", text_color="gray60", anchor="w"
+        ).grid(row=0, column=3, padx=(0, 12))
+
         # ── Output folder row ─────────────────────────────────────────────────
         out_frame = ctk.CTkFrame(self)
-        out_frame.grid(row=2, column=0, padx=16, pady=6, sticky="ew")
+        out_frame.grid(row=3, column=0, padx=16, pady=6, sticky="ew")
         out_frame.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(out_frame, text="Output Folder:", width=100, anchor="w").grid(
@@ -112,7 +138,7 @@ class VideoCompressorApp(ctk.CTk):
 
         # ── Start button + status ─────────────────────────────────────────────
         ctrl_frame = ctk.CTkFrame(self, fg_color="transparent")
-        ctrl_frame.grid(row=3, column=0, padx=16, pady=6, sticky="ew")
+        ctrl_frame.grid(row=4, column=0, padx=16, pady=6, sticky="ew")
         ctrl_frame.grid_columnconfigure(1, weight=1)
 
         self.start_btn = ctk.CTkButton(
@@ -130,7 +156,7 @@ class VideoCompressorApp(ctk.CTk):
 
         # ── Progress bar ──────────────────────────────────────────────────────
         prog_frame = ctk.CTkFrame(self, fg_color="transparent")
-        prog_frame.grid(row=4, column=0, padx=16, pady=(0, 6), sticky="ew")
+        prog_frame.grid(row=5, column=0, padx=16, pady=(0, 6), sticky="ew")
         prog_frame.grid_columnconfigure(0, weight=1)
 
         self.progress_bar = ctk.CTkProgressBar(prog_frame, height=18)
@@ -142,7 +168,7 @@ class VideoCompressorApp(ctk.CTk):
 
         # ── Bottom: log + thumbnail ───────────────────────────────────────────
         bottom_frame = ctk.CTkFrame(self, fg_color="transparent")
-        bottom_frame.grid(row=5, column=0, padx=16, pady=(0, 16), sticky="nsew")
+        bottom_frame.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="nsew")
         bottom_frame.grid_columnconfigure(0, weight=1)
         bottom_frame.grid_rowconfigure(0, weight=1)
 
@@ -238,6 +264,7 @@ class VideoCompressorApp(ctk.CTk):
         selected_res: list[str],
     ):
         total = len(selected_res)
+        threads = str(int(self.cpu_threads_var.get()))
         for i, res in enumerate(selected_res):
             cfg = RESOLUTIONS[res]
             res_dir = os.path.join(output_dir, res)
@@ -248,6 +275,7 @@ class VideoCompressorApp(ctk.CTk):
 
             cmd = [
                 "ffmpeg", "-y", "-i", video_path,
+                "-threads", threads,
                 "-c:v", "libx264",
                 "-crf", "23",
                 "-preset", "medium",
