@@ -408,7 +408,7 @@ class VideoCompressorApp(ctk.CTk):
         self._drive_file_vars = []
 
         for meta in files:
-            var = ctk.BooleanVar(value=True)
+            var = ctk.BooleanVar(value=False)
             ctk.CTkCheckBox(
                 self._drive_scroll, text=meta["name"], variable=var,
                 command=self._refresh_start_button,
