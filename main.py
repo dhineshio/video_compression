@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import re
 import shutil
@@ -6,6 +8,9 @@ import tempfile
 import threading
 import time
 import traceback
+import webbrowser
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
@@ -38,6 +43,10 @@ VIDEO_EXTENSIONS = (
 )
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".wmv", ".m4v"}
+
+CLOUD_CONFIG_DIR = Path.home() / ".video_compressor"
+DRIVE_ROOT_FOLDER_NAME = "VideoCompressor"
+POLL_INTERVAL_SECONDS = 20
 
 # ─── Hardware Encoder Detection ───────────────────────────────────────────────
 
@@ -93,6 +102,212 @@ def _video_flags(cfg: dict, encoder: str) -> list[str]:
 
 ENCODER = _detect_encoder()
 
+# ─── Colab Cloud Manager ──────────────────────────────────────────────────────
+
+class ColabCloudManager:
+    """Handles Google Drive OAuth2, folder setup, upload, polling, and download."""
+
+    SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+    def __init__(self, log_fn, status_fn, progress_fn):
+        self._log = log_fn
+        self._set_status = status_fn
+        self._set_progress = progress_fn
+        self.service = None
+        self.folder_ids: dict = {}
+
+    def authenticate(self) -> bool:
+        try:
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            from google.auth.transport.requests import Request
+            from googleapiclient.discovery import build
+        except ImportError:
+            self._log("[Cloud] Missing packages. Run: pip install google-auth-oauthlib google-api-python-client")
+            return False
+
+        token_path = CLOUD_CONFIG_DIR / "token.json"
+        creds_path = CLOUD_CONFIG_DIR / "credentials.json"
+
+        creds = None
+        if token_path.exists():
+            creds = Credentials.from_authorized_user_file(str(token_path), self.SCOPES)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    creds = None
+
+            if not creds:
+                if not creds_path.exists():
+                    self._log(
+                        "[Cloud] credentials.json not found.\n"
+                        f"        Place your Google OAuth credentials at:\n"
+                        f"        {creds_path}\n"
+                        "        (Google Cloud Console → APIs & Services → Credentials\n"
+                        "         → Create OAuth 2.0 Client ID → Desktop App → Download JSON)"
+                    )
+                    return False
+                flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), self.SCOPES)
+                creds = flow.run_local_server(port=0)
+
+            CLOUD_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(creds.to_json())
+
+        self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        self._log("[Cloud] Google Drive authenticated.")
+        return True
+
+    def _find_or_create_folder(self, name: str, parent_id: str | None = None) -> str:
+        q = f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+        if parent_id:
+            q += f" and '{parent_id}' in parents"
+        results = self.service.files().list(q=q, fields="files(id)").execute()
+        files = results.get("files", [])
+        if files:
+            return files[0]["id"]
+        meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+        if parent_id:
+            meta["parents"] = [parent_id]
+        f = self.service.files().create(body=meta, fields="id").execute()
+        return f["id"]
+
+    def ensure_folder_structure(self) -> dict:
+        root_id   = self._find_or_create_folder(DRIVE_ROOT_FOLDER_NAME)
+        input_id  = self._find_or_create_folder("input",  root_id)
+        config_id = self._find_or_create_folder("config", root_id)
+        output_id = self._find_or_create_folder("output", root_id)
+        self.folder_ids = {
+            "root":   root_id,
+            "input":  input_id,
+            "config": config_id,
+            "output": output_id,
+        }
+        self._log("[Cloud] Drive folder structure ready.")
+        return self.folder_ids
+
+    def sync_notebook_to_drive(self, local_notebook_path: str) -> str:
+        """Upload colab_hls.ipynb to VideoCompressor/ in Drive and return its file ID.
+        Always overwrites so the notebook stays up-to-date with local edits."""
+        from googleapiclient.http import MediaFileUpload
+
+        root_id = self.folder_ids["root"]
+        nb_name = Path(local_notebook_path).name
+
+        # Delete any existing copy first
+        self._delete_drive_file_by_name(nb_name, root_id)
+
+        media = MediaFileUpload(local_notebook_path, mimetype="application/json", resumable=False)
+        f = self.service.files().create(
+            body={"name": nb_name, "parents": [root_id]},
+            media_body=media, fields="id",
+        ).execute()
+        file_id = f["id"]
+        self._log(f"[Cloud] Notebook synced to Drive (id: {file_id})")
+        return file_id
+
+    def upload_file(self, local_path: str, drive_folder_id: str,
+                    mime: str = "application/octet-stream",
+                    progress_cb=None) -> str:
+        from googleapiclient.http import MediaFileUpload
+
+        media = MediaFileUpload(
+            local_path, mimetype=mime, resumable=True, chunksize=4 * 1024 * 1024
+        )
+        request = self.service.files().create(
+            body={"name": Path(local_path).name, "parents": [drive_folder_id]},
+            media_body=media, fields="id",
+        )
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status and progress_cb:
+                progress_cb(status.progress() * 100)
+        return response.get("id")
+
+    def _delete_drive_file_by_name(self, filename: str, folder_id: str):
+        results = self.service.files().list(
+            q=f"'{folder_id}' in parents and name='{filename}' and trashed=false",
+            fields="files(id)",
+        ).execute()
+        for f in results.get("files", []):
+            self.service.files().delete(fileId=f["id"]).execute()
+
+    def write_json_to_drive(self, data: dict, filename: str, folder_id: str) -> str:
+        from googleapiclient.http import MediaIoBaseUpload
+
+        content = json.dumps(data, indent=2).encode()
+        media = MediaIoBaseUpload(io.BytesIO(content), mimetype="application/json")
+        self._delete_drive_file_by_name(filename, folder_id)
+        f = self.service.files().create(
+            body={"name": filename, "parents": [folder_id]},
+            media_body=media, fields="id",
+        ).execute()
+        return f["id"]
+
+    def read_json_from_drive(self, filename: str, folder_id: str) -> dict | None:
+        results = self.service.files().list(
+            q=f"'{folder_id}' in parents and name='{filename}' and trashed=false",
+            fields="files(id)",
+        ).execute()
+        files = results.get("files", [])
+        if not files:
+            return None
+        raw = self.service.files().get_media(fileId=files[0]["id"]).execute()
+        return json.loads(raw)
+
+    def find_file_in_folder(self, name_contains: str, folder_id: str) -> dict | None:
+        results = self.service.files().list(
+            q=f"'{folder_id}' in parents and name contains '{name_contains}' and trashed=false",
+            fields="files(id, name, size)",
+        ).execute()
+        files = results.get("files", [])
+        return files[0] if files else None
+
+    def download_file(self, file_id: str, local_path: str):
+        from googleapiclient.http import MediaIoBaseDownload
+
+        request = self.service.files().get_media(fileId=file_id)
+        with open(local_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request, chunksize=4 * 1024 * 1024)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status and self._set_progress:
+                    # 98–100% range for download phase
+                    self._set_progress(98 + status.progress() * 2)
+
+    def poll_for_result(
+        self,
+        output_folder_id: str,
+        config_folder_id: str,
+        zip_prefix: str,
+        on_status_update,
+        on_complete,
+        stop_event: threading.Event,
+    ):
+        self._log(f"[Cloud] Polling Drive every {POLL_INTERVAL_SECONDS}s for results...")
+        while not stop_event.is_set():
+            try:
+                status_data = self.read_json_from_drive("colab_status.json", config_folder_id)
+                if status_data:
+                    on_status_update(status_data)
+                    if status_data.get("state") == "complete":
+                        zip_meta = self.find_file_in_folder(zip_prefix, output_folder_id)
+                        if zip_meta:
+                            on_complete(zip_meta)
+                            return
+                    elif status_data.get("state") == "error":
+                        on_status_update(status_data)
+                        return
+            except Exception as e:
+                self._log(f"[Cloud] Poll error (will retry): {e}")
+
+            stop_event.wait(POLL_INTERVAL_SECONDS)
+
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 ctk.set_appearance_mode("dark")
@@ -112,10 +327,17 @@ class VideoCompressorApp(ctk.CTk):
         self._processing = False
         self._video_duration: float = 0.0
         self._drive_tmp: str = ""
-        # Each entry: ({"id": str, "name": str}, BooleanVar)
         self._drive_file_vars: list[tuple[dict, ctk.BooleanVar]] = []
 
+        # Cloud mode state
+        self._colab_authenticated = False
+        self._colab_mgr: ColabCloudManager | None = None
+        self._stop_polling_event = threading.Event()
+        self._colab_selected_file: dict = {}   # {"id": ..., "name": ..., "size": ...}
+        self._colab_file_var = ctk.StringVar(value="")
+
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── UI Construction ───────────────────────────────────────────────────────
 
@@ -139,6 +361,10 @@ class VideoCompressorApp(ctk.CTk):
             src_frame, text="Google Drive Folder", variable=self._source_var,
             value="drive", command=self._on_source_toggle,
         ).grid(row=0, column=2, padx=12, pady=8)
+        ctk.CTkRadioButton(
+            src_frame, text="Cloud (Colab)", variable=self._source_var,
+            value="colab", command=self._on_source_toggle,
+        ).grid(row=0, column=3, padx=12, pady=8)
 
         # ── Local file row ────────────────────────────────────────────────────
         self._local_frame = ctk.CTkFrame(self)
@@ -186,6 +412,45 @@ class VideoCompressorApp(ctk.CTk):
         self._drive_scroll = ctk.CTkScrollableFrame(self._drive_list_frame, height=110)
         self._drive_scroll.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="ew")
         self._drive_scroll.grid_columnconfigure(0, weight=1)
+
+        # ── Cloud (Colab) row (hidden initially) ──────────────────────────────
+        self._colab_frame = ctk.CTkFrame(self)
+        self._colab_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(self._colab_frame, text="Cloud Mode:", width=100, anchor="w").grid(
+            row=0, column=0, padx=(12, 6), pady=10
+        )
+        self._colab_status_label = ctk.CTkLabel(
+            self._colab_frame,
+            text="Authenticate Google Drive, then pick a video from your Drive to compress on Colab.",
+            anchor="w", text_color="gray60", wraplength=440,
+        )
+        self._colab_status_label.grid(row=0, column=1, padx=6, pady=10, sticky="ew")
+
+        self._colab_auth_btn = ctk.CTkButton(
+            self._colab_frame, text="Authenticate Google", width=160,
+            command=self._colab_authenticate_threaded,
+        )
+        self._colab_auth_btn.grid(row=0, column=2, padx=(6, 6), pady=10)
+
+        self._colab_browse_btn = ctk.CTkButton(
+            self._colab_frame, text="Browse Drive", width=120,
+            command=self._colab_browse_drive_threaded, state="disabled",
+        )
+        self._colab_browse_btn.grid(row=0, column=3, padx=(0, 12), pady=10)
+
+        # ── Cloud Drive file list (hidden until Browse) ───────────────────────
+        self._colab_list_frame = ctk.CTkFrame(self)
+        self._colab_list_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            self._colab_list_frame,
+            text="Select a video from your Drive to compress on Colab:", anchor="w",
+        ).grid(row=0, column=0, padx=12, pady=(8, 2), sticky="w")
+
+        self._colab_scroll = ctk.CTkScrollableFrame(self._colab_list_frame, height=120)
+        self._colab_scroll.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="ew")
+        self._colab_scroll.grid_columnconfigure(0, weight=1)
 
         # ── Resolution checkboxes + encoder label ─────────────────────────────
         res_frame = ctk.CTkFrame(self)
@@ -302,18 +567,33 @@ class VideoCompressorApp(ctk.CTk):
         self.thumb_label = ctk.CTkLabel(thumb_frame, text="—", text_color="gray60")
         self.thumb_label.pack(padx=8, pady=8, fill="both", expand=True)
 
+    # ── Window Close ──────────────────────────────────────────────────────────
+
+    def _on_close(self):
+        self._stop_polling_event.set()
+        self.destroy()
+
     # ── Source Toggle ─────────────────────────────────────────────────────────
 
     def _on_source_toggle(self):
-        if self._source_var.get() == "local":
-            self._drive_frame.grid_remove()
-            self._drive_list_frame.grid_remove()
+        mode = self._source_var.get()
+        self._local_frame.grid_remove()
+        self._drive_frame.grid_remove()
+        self._drive_list_frame.grid_remove()
+        self._colab_frame.grid_remove()
+        self._colab_list_frame.grid_remove()
+
+        if mode == "local":
             self._local_frame.grid(row=1, column=0, padx=16, pady=4, sticky="ew")
-        else:
-            self._local_frame.grid_remove()
+        elif mode == "drive":
             self._drive_frame.grid(row=1, column=0, padx=16, pady=4, sticky="ew")
             if self._drive_file_vars:
                 self._drive_list_frame.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
+        elif mode == "colab":
+            self._colab_frame.grid(row=1, column=0, padx=16, pady=4, sticky="ew")
+            if self._colab_selected_file:
+                self._colab_list_frame.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
+
         self._refresh_start_button()
 
     # ── File Selection ────────────────────────────────────────────────────────
@@ -335,14 +615,22 @@ class VideoCompressorApp(ctk.CTk):
             self._refresh_start_button()
 
     def _refresh_start_button(self):
-        if self._source_var.get() == "local":
+        mode = self._source_var.get()
+        if mode == "local":
             ready = bool(self.video_path and self.output_dir and not self._processing)
-        else:
+        elif mode == "drive":
             any_selected = any(v.get() for _, v in self._drive_file_vars)
             ready = bool(any_selected and self.output_dir and not self._processing)
+        else:  # colab
+            ready = bool(
+                self._colab_authenticated
+                and self._colab_selected_file
+                and self.output_dir
+                and not self._processing
+            )
         self.start_btn.configure(state="normal" if ready else "disabled")
 
-    # ── Google Drive ──────────────────────────────────────────────────────────
+    # ── Google Drive (folder mode) ────────────────────────────────────────────
 
     def _fetch_drive_files_threaded(self):
         url = self.drive_url_entry.get().strip()
@@ -368,7 +656,6 @@ class VideoCompressorApp(ctk.CTk):
 
         try:
             self._log(f"[Drive] Listing folder: {url}")
-            # skip_download=True returns file metadata without downloading
             entries = gdown.download_folder(url, skip_download=True, quiet=True)
             if entries is None:
                 raise RuntimeError("Could not retrieve folder. Make sure it is publicly shared.")
@@ -402,7 +689,6 @@ class VideoCompressorApp(ctk.CTk):
             self.after(0, lambda: self._set_status("Idle", "gray70"))
 
     def _render_drive_file_list(self, files: list[dict]):
-        """Show checkboxes for each Drive video file (no download yet)."""
         for widget in self._drive_scroll.winfo_children():
             widget.destroy()
         self._drive_file_vars = []
@@ -420,12 +706,9 @@ class VideoCompressorApp(ctk.CTk):
         self._refresh_start_button()
 
     def _download_drive_file(self, file_id: str, file_name: str, out_path: str):
-        """Download a Drive file via gdown (handles redirects/confirmations) with
-        progress polling based on the growing file size on disk."""
         import gdown
         import requests
 
-        # Try a HEAD request to get total size for accurate progress bar
         expected_size = 0
         try:
             r = requests.head(
@@ -451,7 +734,6 @@ class VideoCompressorApp(ctk.CTk):
         dl_thread = threading.Thread(target=_do_download, daemon=True)
         dl_thread.start()
 
-        # Poll the file size on disk every 0.5 s for live progress
         while dl_thread.is_alive():
             if os.path.exists(out_path) and expected_size > 0:
                 current = os.path.getsize(out_path)
@@ -491,6 +773,184 @@ class VideoCompressorApp(ctk.CTk):
         self._drive_file_vars = []
         self._drive_list_frame.grid_remove()
         self._refresh_start_button()
+
+    # ── Cloud (Colab) Mode ────────────────────────────────────────────────────
+
+    def _colab_authenticate_threaded(self):
+        self._colab_auth_btn.configure(state="disabled", text="Authenticating…")
+        threading.Thread(target=self._colab_authenticate, daemon=True).start()
+
+    def _colab_authenticate(self):
+        mgr = ColabCloudManager(self._log, self._set_status, self._set_progress)
+        success = mgr.authenticate()
+        if success:
+            self._colab_mgr = mgr
+            self._colab_authenticated = True
+            self.after(0, lambda: self._colab_auth_btn.configure(
+                text="✓ Authenticated", state="disabled",
+                fg_color="#2ecc71", hover_color="#27ae60",
+            ))
+            self.after(0, lambda: self._colab_browse_btn.configure(state="normal"))
+            self.after(0, lambda: self._colab_status_label.configure(
+                text="Authenticated. Click 'Browse Drive' to pick a video from your Drive.",
+                text_color="white",
+            ))
+        else:
+            self.after(0, lambda: self._colab_auth_btn.configure(
+                state="normal", text="Authenticate Google",
+            ))
+            self.after(0, lambda: messagebox.showerror(
+                "Auth Failed", "Google authentication failed. See the log for details."
+            ))
+        self.after(0, self._refresh_start_button)
+
+    def _colab_browse_drive_threaded(self):
+        self._colab_browse_btn.configure(state="disabled", text="Loading…")
+        threading.Thread(target=self._colab_browse_drive, daemon=True).start()
+
+    def _colab_browse_drive(self):
+        VIDEO_MIME_TYPES = (
+            "video/mp4", "video/quicktime", "video/x-msvideo",
+            "video/x-matroska", "video/webm", "video/x-flv", "video/x-m4v",
+        )
+        try:
+            self._log("[Cloud] Listing video files from your Google Drive…")
+            q = " or ".join(f"mimeType='{m}'" for m in VIDEO_MIME_TYPES)
+            results = self._colab_mgr.service.files().list(
+                q=f"({q}) and trashed=false",
+                fields="files(id, name, size)",
+                orderBy="modifiedTime desc",
+                pageSize=100,
+            ).execute()
+            files = results.get("files", [])
+            if not files:
+                self.after(0, lambda: messagebox.showwarning(
+                    "No Videos", "No video files found in your Google Drive."
+                ))
+                return
+            self._log(f"[Cloud] Found {len(files)} video(s) in Drive.")
+            self.after(0, self._colab_render_file_list, files)
+        except Exception:
+            err = traceback.format_exc()
+            self._log(f"[Cloud] Browse error:\n{err}")
+            self.after(0, lambda: messagebox.showerror(
+                "Browse Error", "Failed to list Drive files. See log for details."
+            ))
+        finally:
+            self.after(0, lambda: self._colab_browse_btn.configure(
+                state="normal", text="Browse Drive"
+            ))
+
+    def _colab_render_file_list(self, files: list[dict]):
+        for widget in self._colab_scroll.winfo_children():
+            widget.destroy()
+        self._colab_file_var.set("")
+        self._colab_selected_file = {}
+
+        for meta in files:
+            size_mb = int(meta.get("size", 0)) / 1024 / 1024
+            label = f"{meta['name']}  ({size_mb:.0f} MB)" if size_mb > 0 else meta["name"]
+            ctk.CTkRadioButton(
+                self._colab_scroll,
+                text=label,
+                variable=self._colab_file_var,
+                value=meta["id"],
+                command=lambda m=meta: self._colab_on_file_select(m),
+            ).pack(anchor="w", padx=8, pady=2)
+
+        self._colab_list_frame.grid(row=2, column=0, padx=16, pady=4, sticky="ew")
+        self._refresh_start_button()
+
+    def _colab_on_file_select(self, meta: dict):
+        self._colab_selected_file = meta
+        self._colab_status_label.configure(
+            text=f"Selected: {meta['name']}", text_color="white"
+        )
+        self._refresh_start_button()
+
+    def _run_colab_cloud(self, drive_file: dict, output_dir: str, selected_res: list[str]):
+        mgr = self._colab_mgr
+        video_name = drive_file["name"]
+        video_file_id = drive_file["id"]
+        zip_prefix = Path(video_name).stem
+
+        try:
+            # 1. Ensure Drive folders (config + output only — no upload needed)
+            self._set_status("Setting up Drive folders…", "#3a9bd5")
+            mgr.ensure_folder_structure()
+            self._set_progress(10)
+
+            # 2. Write config (file is already in Drive — just pass its ID)
+            self._set_status("Writing config to Drive…", "#3a9bd5")
+            config = {
+                "input_filename": video_name,
+                "input_file_id": video_file_id,
+                "selected_resolutions": selected_res,
+                "output_folder_id": mgr.folder_ids["output"],
+                "config_folder_id": mgr.folder_ids["config"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            mgr.write_json_to_drive(config, "colab_config.json", mgr.folder_ids["config"])
+            # Clear any old status from a previous run
+            mgr._delete_drive_file_by_name("colab_status.json", mgr.folder_ids["config"])
+            self._set_progress(20)
+            self._log(f"[Cloud] Config written for: {video_name}")
+            self._log(f"[Cloud] Drive file ID: {video_file_id}")
+
+            # 3. Sync notebook to Drive and open it in Colab
+            self._set_status("Syncing notebook to Drive…", "#3a9bd5")
+            local_nb = Path(__file__).parent / "colab_hls.ipynb"
+            nb_id = mgr.sync_notebook_to_drive(str(local_nb))
+            colab_url = f"https://colab.research.google.com/drive/{nb_id}"
+            webbrowser.open(colab_url)
+            self._set_status("Waiting for Colab… Open the browser tab → Runtime → Run All", "#f39c12")
+            self._log(f"[Cloud] Colab URL: {colab_url}")
+            self._set_progress(25)
+
+            # 4. Poll Drive for results
+            self._stop_polling_event.clear()
+
+            def on_status(data):
+                msg = data.get("message", "Running…")
+                pct = data.get("progress_pct", 0)
+                self._set_status(f"Colab: {msg}", "#3a9bd5")
+                self._set_progress(25 + pct * 0.72)  # 25–97%
+
+            def on_complete(zip_meta):
+                local_zip = os.path.join(output_dir, zip_meta["name"])
+                self._set_status("Downloading result…", "#3a9bd5")
+                self._log(f"[Cloud] Downloading result: {zip_meta['name']}")
+                mgr.download_file(zip_meta["id"], local_zip)
+                with zipfile.ZipFile(local_zip, "r") as zf:
+                    zf.extractall(output_dir)
+                os.remove(local_zip)
+                self._set_progress(100)
+                self._set_status("Completed", "#2ecc71")
+                self._log(f"[Cloud] Done. Extracted to: {output_dir}")
+                self._processing = False
+                self.after(0, lambda: messagebox.showinfo(
+                    "Done", f"Cloud output saved to:\n{output_dir}"
+                ))
+                self.after(0, self._refresh_start_button)
+
+            mgr.poll_for_result(
+                output_folder_id=mgr.folder_ids["output"],
+                config_folder_id=mgr.folder_ids["config"],
+                zip_prefix=zip_prefix,
+                on_status_update=lambda d: self.after(0, on_status, d),
+                on_complete=lambda z: self.after(0, on_complete, z),
+                stop_event=self._stop_polling_event,
+            )
+
+        except Exception:
+            err = traceback.format_exc()
+            self._log(f"\n[Cloud ERROR]\n{err}")
+            self._set_status("Error", "#e74c3c")
+            self.after(0, lambda: messagebox.showerror(
+                "Cloud Error", "Cloud processing failed. See log for details."
+            ))
+            self._processing = False
+            self.after(0, self._refresh_start_button)
 
     # ── Logging helpers ───────────────────────────────────────────────────────
 
@@ -546,11 +1006,9 @@ class VideoCompressorApp(ctk.CTk):
         n = len(selected_res)
         duration = self._video_duration or 1.0
 
-        # Create per-resolution output dirs
         for res in selected_res:
             os.makedirs(os.path.join(output_dir, res), exist_ok=True)
 
-        # filter_complex: decode once → split → scale each branch
         split_labels = "".join(f"[v{i}]" for i in range(n))
         filter_parts = [f"[0:v]split={n}{split_labels}"]
         for i, res in enumerate(selected_res):
@@ -558,7 +1016,6 @@ class VideoCompressorApp(ctk.CTk):
             filter_parts.append(f"[v{i}]scale={cfg['width']}:{cfg['height']}[s{i}]")
         filter_complex = ";".join(filter_parts)
 
-        # NVENC needs hwaccel flag; VideoToolbox and CPU do not
         hwaccel = ["-hwaccel", "cuda"] if ENCODER == "nvenc" else []
 
         base_cmd = [
@@ -570,7 +1027,6 @@ class VideoCompressorApp(ctk.CTk):
         if ENCODER == "cpu":
             base_cmd += ["-threads", str(int(self.cpu_threads_var.get()))]
 
-        # One output block per resolution
         per_output: list[str] = []
         for i, res in enumerate(selected_res):
             cfg = RESOLUTIONS[res]
@@ -616,7 +1072,6 @@ class VideoCompressorApp(ctk.CTk):
         for res in selected_res:
             self._log(f"[HLS] {res} → {os.path.join(output_dir, res, 'playlist.m3u8')}")
 
-        # Write master playlist
         master_path = os.path.join(output_dir, "master.m3u8")
         with open(master_path, "w") as f:
             f.write("#EXTM3U\n#EXT-X-VERSION:3\n")
@@ -653,15 +1108,7 @@ class VideoCompressorApp(ctk.CTk):
             messagebox.showwarning("No Resolution", "Select at least one resolution.")
             return
 
-        if self._source_var.get() == "local":
-            video_paths = [self.video_path]
-            drive_metas = []
-        else:
-            drive_metas = [m for m, v in self._drive_file_vars if v.get()]
-            if not drive_metas:
-                messagebox.showwarning("No Files", "Select at least one video file.")
-                return
-            video_paths = []  # will be filled after download in _run_processing
+        mode = self._source_var.get()
 
         self._processing = True
         self.start_btn.configure(state="disabled")
@@ -670,6 +1117,28 @@ class VideoCompressorApp(ctk.CTk):
         self.log_box.configure(state="disabled")
         self._set_progress(0)
         self._set_status("Processing…", "#3a9bd5")
+
+        # ── Cloud (Colab) mode ────────────────────────────────────────────────
+        if mode == "colab":
+            threading.Thread(
+                target=self._run_colab_cloud,
+                args=(self._colab_selected_file, self.output_dir, selected_res),
+                daemon=True,
+            ).start()
+            return
+
+        # ── Local / Drive mode ────────────────────────────────────────────────
+        if mode == "local":
+            video_paths = [self.video_path]
+            drive_metas = []
+        else:
+            drive_metas = [m for m, v in self._drive_file_vars if v.get()]
+            if not drive_metas:
+                messagebox.showwarning("No Files", "Select at least one video file.")
+                self._processing = False
+                self._refresh_start_button()
+                return
+            video_paths = []
 
         threading.Thread(
             target=self._run_processing,
@@ -684,7 +1153,6 @@ class VideoCompressorApp(ctk.CTk):
         output_dir: str,
         selected_res: list[str],
     ):
-        # ── Download Drive files first (if any) ───────────────────────────────
         if drive_metas:
             tmp = tempfile.mkdtemp(prefix="vc_drive_")
             self._drive_tmp = tmp
@@ -746,7 +1214,6 @@ class VideoCompressorApp(ctk.CTk):
 
         finally:
             self._processing = False
-            # Clean up Drive temp files after processing
             if self._drive_tmp:
                 shutil.rmtree(self._drive_tmp, ignore_errors=True)
                 self._drive_tmp = ""
