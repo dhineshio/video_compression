@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault('TK_SILENCE_DEPRECATION', '1')
 import re
 import shutil
 import subprocess
@@ -256,20 +257,27 @@ class VideoCompressorApp(ctk.CTk):
         # ── Start button + status ─────────────────────────────────────────────
         ctrl_frame = ctk.CTkFrame(self, fg_color="transparent")
         ctrl_frame.grid(row=6, column=0, padx=16, pady=4, sticky="ew")
-        ctrl_frame.grid_columnconfigure(1, weight=1)
+        ctrl_frame.grid_columnconfigure(2, weight=1)
 
         self.start_btn = ctk.CTkButton(
             ctrl_frame, text="Start Processing", width=160,
             state="disabled", command=self.process_video,
             fg_color="#1f6aa5", hover_color="#144e7a",
         )
-        self.start_btn.grid(row=0, column=0, padx=(0, 16), pady=4)
+        self.start_btn.grid(row=0, column=0, padx=(0, 8), pady=4)
+
+        self.clear_tmp_btn = ctk.CTkButton(
+            ctrl_frame, text="Clear Temp", width=100,
+            command=self._clear_temp_files,
+            fg_color="#5a3e3e", hover_color="#7a2e2e",
+        )
+        self.clear_tmp_btn.grid(row=0, column=1, padx=(0, 16), pady=4)
 
         self.status_label = ctk.CTkLabel(
             ctrl_frame, text="Idle", anchor="w",
             font=ctk.CTkFont(size=14, weight="bold"), text_color="gray70",
         )
-        self.status_label.grid(row=0, column=1, pady=4, sticky="w")
+        self.status_label.grid(row=0, column=2, pady=4, sticky="w")
 
         # ── Progress bar ──────────────────────────────────────────────────────
         prog_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -491,6 +499,20 @@ class VideoCompressorApp(ctk.CTk):
         self._drive_file_vars = []
         self._drive_list_frame.grid_remove()
         self._refresh_start_button()
+
+    def _clear_temp_files(self):
+        import glob
+        tmp_root = tempfile.gettempdir()
+        folders = glob.glob(os.path.join(tmp_root, "vc_drive_*"))
+        if self._drive_tmp and self._drive_tmp not in folders:
+            folders.append(self._drive_tmp)
+        if not folders:
+            messagebox.showinfo("Clear Temp", "No temp files found.")
+            return
+        for folder in folders:
+            shutil.rmtree(folder, ignore_errors=True)
+        self._drive_tmp = ""
+        messagebox.showinfo("Clear Temp", f"Deleted {len(folders)} temp folder(s).")
 
     # ── Logging helpers ───────────────────────────────────────────────────────
 
